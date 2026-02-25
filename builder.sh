@@ -47,7 +47,6 @@ _add_apprun_header() {
 
 _add_apprun_footer() {
 	cat <<-'HEREDOC' >> "$APP"/"$APP".AppDir/AppRun
-	export PATH="${HERE}"/usr/bin/:"${HERE}"/usr/sbin/:"${HERE}"/usr/games/:"${HERE}"/bin/:"${HERE}"/sbin/:"${PATH}"
 
 	lib_dirs_in=$(find "$HERE" -type f -name 'lib*.so*' -printf '%h\n' | sed "s|^$HERE||" | sort -u)
 	lib_dirs_out=$(ldd "${HERE}"/usr/bin/SAMPLE | awk '/=>/ { print $3 }' | xargs -r dirname | sort -u | grep -v "^/tmp")
@@ -72,16 +71,57 @@ _add_apprun_footer() {
 	chmod a+x "$APP"/"$APP".AppDir/AppRun
 }
 
-_add_libunionpreload() {
-	# Use libunionpreload.so to allow the AppImage to run any .gresource files (and locale files)
-	if [ ! -f "$APP"/"$APP".AppDir/libunionpreload.so ]; then
-		wget -q https://github.com/project-portable/libunionpreload/releases/download/amd64/libunionpreload.so -O "$APP"/"$APP".AppDir/libunionpreload.so && chmod a+x libunionpreload.so
+_add_libgresource_intercept() {
+	# Create and use libgresource_intercept.so
+	if [ ! -f ./libgresource_intercept.so ]; then
+		cat <<-'HEREDOC' >> gresource_intercept.c
+		#define _GNU_SOURCE
+		#include <dlfcn.h>
+		#include <stdlib.h>
+		#include <string.h>
+		#include <stdio.h>
+
+		/* Forward declarations so we don't need glib headers */
+		typedef void GResource;
+		typedef void GError;
+		typedef char gchar;
+
+		typedef GResource* (*real_g_resource_load_t)(const gchar*, GError**);
+
+		GResource* g_resource_load(const gchar *filename, GError **error)
+		{
+		    static real_g_resource_load_t real_func = NULL;
+
+		    if (!real_func)
+		        real_func = (real_g_resource_load_t)
+		            dlsym(RTLD_NEXT, "g_resource_load");
+
+		    const char *target =
+		        "/usr/share/REPLACE/gsm.gresource";
+
+		    const char *appdir = getenv("APPDIR");
+
+		    if (appdir && filename && strcmp(filename, target) == 0) {
+		        char newpath[512];
+		        snprintf(newpath, sizeof(newpath),
+		                 "%s/usr/share/REPLACE/gsm.gresource",
+		                 appdir);
+
+		        return real_func(newpath, error);
+		    }
+
+		    return real_func(filename, error);
+		}
+		HEREDOC
+		sed -i -- "s/REPLACE/$APP/g" ./gresource_intercept.c
+		gcc -shared -fPIC gresource_intercept.c -o libgresource_intercept.so -ldl
 	fi
-	[ ! -f "$APP"/"$APP".AppDir/libunionpreload.so ] && exit 1
+
+	[ ! -f ./libgresource_intercept.so ] && exit 1
+	cp -r libgresource_intercept.so "$APP"/"$APP".AppDir/usr/lib/
 
 	cat <<-'HEREDOC' >> "$APP"/"$APP".AppDir/AppRun
-	export UNION_PRELOAD="${HERE}"
-	export LD_PRELOAD="${HERE}"/libunionpreload.so
+	export LD_PRELOAD="${HERE}"/usr/lib/libgresource_intercept.so:"${LD_PRELOAD}"
 	HEREDOC
 }
 
@@ -130,12 +170,10 @@ _add_liblocale_intercept() {
 }
 
 _add_apprun_header
-
+_add_liblocale_intercept
 GRESOURCE_FILE=$(find "$APP"/"$APP".AppDir/usr/share -type f -name *.gresource)
 if [ -n "$GRESOURCE_FILE" ]; then
-	_add_libunionpreload
-else
-	_add_liblocale_intercept
+	_add_libgresource_intercept
 fi
 
 _add_apprun_footer
